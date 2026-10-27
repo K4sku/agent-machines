@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Bring the base machine up to date and leave it ready to be cloned: stops the dev stack,
+# fast-forwards main to origin/main and runs agent-setup.
+#
+# Machines have no GitHub access: this does NOT fetch. The Mac (task refresh) pushes origin/main in first.
+set -euo pipefail
+. /opt/task-agent/env.sh
+cd "$AGENT_REPO"
+
+[ ! -d "$HOME/task" ] || { echo "~/task exists: this looks like a task machine, not the base. Refusing." >&2; exit 1; }
+
+if [ -S "$OVERMIND_SOCKET" ]; then overmind quit || true; fi
+for _ in $(seq 1 20); do [ -S "$OVERMIND_SOCKET" ] || break; sleep 1; done
+rm -f "$OVERMIND_SOCKET" tmp/pids/*.pid
+
+[ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { echo "Base must be on main" >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo "Base has uncommitted changes:" >&2; git status --short >&2; exit 1; }
+git merge --ff-only origin/main
+agent-setup
+git log -1 --format='Base ready to clone: main at %h %s (%cr)'

@@ -1,0 +1,10 @@
+{
+  "skipDangerousModePermissionPrompt": true,
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agent-status hook working" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "agent-status hook heartbeat" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "agent-ci-gate", "timeout": 1800 }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "agent-status hook needs_input" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "agent-status hook exited" }] }]
+  }
+}

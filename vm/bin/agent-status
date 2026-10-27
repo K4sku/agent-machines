@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Task status, stored in ~/task/status.json and read by the Mac (task ls / watch).
+#
+#   agent-status                    print status JSON ({"state":"none"} outside a task machine)
+#   agent-status set STATE [MSG]    set state explicitly (used by the task agent and scripts)
+#   agent-status field KEY VALUE    store an extra field (e.g. `field pr 12`, set by the Mac)
+#   agent-status hook STATE         called by Claude Code hooks; reads hook JSON on stdin
+#                                   (STATE "heartbeat" = tool use: working, but never un-sticks)
+#
+# States: starting, ready, working, idle, needs_input, done, blocked, failed, exited.
+# done/blocked/failed are "sticky": hooks won't overwrite them with idle/needs_input/exited,
+# only a new user prompt (hook working) or an explicit `set` does.
+set -euo pipefail
+
+TASK_DIR="${AGENT_TASK_DIR:-$HOME/task}"
+STATUS="$TASK_DIR/status.json"
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+current() { [ -f "$STATUS" ] && jq -r '.state // "none"' "$STATUS" 2>/dev/null || echo none; }
+
+write() { # state message
+  local tmp
+  tmp=$(mktemp "$TASK_DIR/.status.XXXXXX")
+  jq -n --arg state "$1" --arg message "$2" --arg at "$(now)" \
+        --slurpfile old <( [ -f "$STATUS" ] && cat "$STATUS" || echo '{}' ) \
+    '($old[0] // {}) + {state: $state, message: $message, updated_at: $at}' > "$tmp"
+  mv "$tmp" "$STATUS"
+}
+
+case "${1:-show}" in
+  show)
+    if [ -f "$STATUS" ]; then cat "$STATUS"; else echo '{"state":"none"}'; fi
+    ;;
+  set)
+    [ -n "${2:-}" ] || { echo "usage: agent-status set STATE [MESSAGE]" >&2; exit 1; }
+    mkdir -p "$TASK_DIR"
+    write "$2" "${3:-}"
+    ;;
+  field)
+    [ -n "${2:-}" ] && [ $# -ge 3 ] || { echo "usage: agent-status field KEY VALUE" >&2; exit 1; }
+    [ -f "$STATUS" ] || { echo "no task status here" >&2; exit 1; }
+    tmp=$(mktemp "$TASK_DIR/.status.XXXXXX")
+    jq --arg k "$2" --arg v "$3" '.[$k] = $v' "$STATUS" > "$tmp" && mv "$tmp" "$STATUS"
+    ;;
+  hook)
+    # Outside a task machine (e.g. the base) hooks are no-ops.
+    [ -f "$STATUS" ] || { cat >/dev/null; exit 0; }
+    input=$(cat)
+    state="${2:?hook state required}"
+    cur=$(current)
+    case "$cur" in
+      done|blocked|failed) [ "$state" = working ] || exit 0 ;;
+    esac
+    [ "$state" = heartbeat ] && state=working
+    # Claude notifies after sitting idle at the prompt too; that's a finished turn, not a question.
+    [ "$state" = needs_input ] && [ "$(jq -r '.notification_type // ""' <<<"$input" 2>/dev/null)" = idle_prompt ] && state=idle
+    msg=""
+    [ "$state" = needs_input ] && msg=$(jq -r '.message // ""' <<<"$input" 2>/dev/null || true)
+    # Heartbeats while working shouldn't clobber the message the agent last set.
+    if [ "$state" = working ] && [ "$cur" = working ]; then
+      msg=$(jq -r '.message // ""' "$STATUS")
+    fi
+    write "$state" "$msg"
+    ;;
+  *)
+    echo "usage: agent-status [show | set STATE [MESSAGE] | field KEY VALUE | hook STATE]" >&2; exit 1
+    ;;
+esac

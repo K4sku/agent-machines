@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# (Re)start the dev stack under overmind and wait until the app answers on $APP_PORT.
+set -euo pipefail
+. /opt/task-agent/env.sh
+cd "$AGENT_REPO"
+if [ -S "$OVERMIND_SOCKET" ]; then overmind quit >/dev/null 2>&1 || true; sleep 3; fi
+rm -f "$OVERMIND_SOCKET" tmp/pids/*.pid
+overmind start -D >/dev/null
+for _ in $(seq 1 60); do
+  curl -s -o /dev/null "http://localhost:$APP_PORT/" && exit 0
+  sleep 2
+done
+echo "dev stack did not come up on localhost:$APP_PORT (overmind echo)" >&2
+exit 1

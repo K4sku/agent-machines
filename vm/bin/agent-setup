@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# PROJECT: install dependencies and prepare databases for the current checkout. Run by agent-refresh
+# (base) and agent-prepare (task machine); must be idempotent. Example for Rails:
+set -euo pipefail
+. /opt/task-agent/env.sh
+cd "$AGENT_REPO"
+bundle check >/dev/null 2>&1 || bundle install --quiet
+bin/rails db:prepare >/dev/null
+RAILS_ENV=test bin/rails db:prepare >/dev/null

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# PROJECT: the full check a change must pass, ideally the same as GitHub CI. The CI gate (Stop hook)
+# runs it on the agent's new commits; the exit code decides. Example for Rails:
+set -euo pipefail
+. /opt/task-agent/env.sh
+cd "$AGENT_REPO"
+bin/rubocop
+bin/rails db:test:prepare test

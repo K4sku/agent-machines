@@ -1,0 +1,408 @@
+#!/bin/bash
+# Mac-side orchestrator: one OrbStack machine per task ($BASE-<id>), cloned from the base machine $BASE.
+# All GitHub access happens here; machines have none. Settings: config.sh.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/config.sh"
+VM_HOME=/home/$VM_USER
+VM_REPO=$VM_HOME/$REPO_DIR
+P=$BASE-
+
+die() { echo "task: $*" >&2; exit 1; }
+g() { git -C "$REPO" "$@"; }
+# orb run can leave the terminal in raw mode (newlines without carriage returns), which garbles
+# whatever is printed next; restore the terminal after every call.
+TTY_STATE=$(stty -g 2>/dev/null < /dev/tty || true)
+orb_run() {
+  local rc=0
+  if [ -t 0 ]; then orb run "$@" < /dev/null || rc=$?; else orb run "$@" || rc=$?; fi
+  [ -z "$TTY_STATE" ] || stty "$TTY_STATE" 2>/dev/null < /dev/tty || true
+  return $rc
+}
+vm() { local id=$1; shift; orb_run -m "$P$id" "$@"; }
+remote() { echo "ssh://$1@orb$VM_REPO"; }
+exists() { orb list -q | grep -qx "$1"; }
+running() { orb list -f json | jq -r --arg n "$1" '.[] | select(.name == $n) | .state' | grep -qx running; }
+task_ids() { orb list -q | sed -n "s/^$P//p"; }
+status() { vm "$1" agent-status; }
+sfield() { status "$1" | jq -r --arg k "$2" '.[$k] // empty'; }
+need() { [ -n "${1:-}" ] || die "usage: task $2"; }
+protected() {
+  git check-ref-format --branch "$1" >/dev/null 2>&1 || return 0
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in main|master|production) return 0;; esac
+  return 1
+}
+
+# The machine's status.json is writable by a permissions-off agent, so the branch recorded at
+# `task new` time on the Mac is the one that counts.
+branch_of() {
+  local id=$1 branch
+  branch=$(cat "$HERE/tasks/$id/branch" 2>/dev/null) || die "no tasks/$id/branch recorded on the Mac"
+  [ "$(sfield "$id" branch)" = "$branch" ] || die "$P$id reports a different branch than recorded ($branch)"
+  echo "$branch"
+}
+
+fetch_branch() {
+  local id=$1 branch
+  branch=$(branch_of "$id") || exit 1
+  g fetch -q "$(remote "$P$id")" "+refs/heads/$branch:refs/remotes/$P$id/$branch"
+  echo "$branch"
+}
+
+# Commits on GitHub's copy of the branch that the machine lacks (someone else's push, "Update branch").
+# --cherry-pick hides the machine's own commits that a rebase merely rewrote.
+github_only() {
+  g rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null || return 0
+  g --no-pager log --oneline --cherry-pick --right-only "$2...refs/remotes/origin/$1"
+}
+
+save_artifacts() {
+  local id=$1 dir=$HERE/tasks/$1 src=$HOME/OrbStack/$P$1$VM_HOME/task
+  mkdir -p "$dir"
+  [ -f "$src/RESULT.md" ] && cp "$src/RESULT.md" "$dir/"
+  return 0
+}
+
+# Issue/PR attachments need a GitHub login, which machines don't have: download them here and
+# point the markdown at the local copies (images/ sits next to the .md on both sides).
+send_github_file() {
+  local id=$1 name=$2 dir=$HERE/tasks/$1 url out tmp
+  mkdir -p "$dir/images"
+  for url in $(grep -oE 'https://github\.com/user-attachments/(assets|files)/[^]"<>)[:space:]]+' "$dir/$name" | sort -u); do
+    out=$(basename "$url")
+    tmp=$dir/images/.download
+    curl -fsSL -H "Authorization: token $(gh auth token)" -o "$tmp" "$url" || { echo "task: could not download $url" >&2; continue; }
+    case "$out" in *.*) ;; *) out=$out.$(file -b --mime-type "$tmp" | sed 's|.*/||');; esac
+    mv "$tmp" "$dir/images/$out"
+    sed -i '' "s|$url|images/$out|g" "$dir/$name"
+  done
+  vm "$id" mkdir -p "$VM_HOME/task/github/images"
+  COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -C "$dir/images" -cf - . | vm "$id" tar -C "$VM_HOME/task/github/images" -xf -
+  vm "$id" sh -c "cat > $VM_HOME/task/github/$name" < "$dir/$name"
+}
+
+cmd_refresh() {
+  local was_running=""
+  running "$BASE" && was_running=1
+  g fetch -q origin
+  orb start "$BASE"
+  g push -q "$(remote "$BASE")" "+origin/main:refs/remotes/origin/main"
+  orb_run -m "$BASE" agent-refresh
+  [ -n "$was_running" ] || orb stop "$BASE"
+}
+
+cmd_new() {
+  local id=${1:-} branch=${2:-} prompt="" issue=""
+  need "$id" "new <id> <branch> [<prompt-file>] [--issue <n>]"
+  need "$branch" "new <id> <branch> [<prompt-file>] [--issue <n>]"
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue) issue=${2:-}; need "$issue" "new ... --issue <n>"; shift 2;;
+      *) prompt=$1; shift;;
+    esac
+  done
+  [ -n "$prompt$issue" ] || die "give a prompt file and/or --issue <n>"
+  [ -z "$prompt" ] || [ -f "$prompt" ] || die "no such prompt file: $prompt"
+  protected "$branch" && die "refusing to work on $branch"
+  exists "$P$id" && die "$P$id already exists"
+
+  local n
+  n=$(orb list -f json | jq --arg p "$P" '[.[] | select((.name | startswith($p)) and .state == "running")] | length')
+  [ "$n" -lt "$SOFT_LIMIT" ] || echo "task: warning: $n tasks already running (soft limit $SOFT_LIMIT)" >&2
+
+  local dir=$HERE/tasks/$id
+  mkdir -p "$dir"
+  echo "$branch" > "$dir/branch"
+  if [ -n "$issue" ]; then
+    gh issue view "$issue" --repo "$GH_REPO" --json number,title,url,author,labels,body,comments --jq '
+      "# #\(.number) \(.title)\n\n\(.url) — by @\(.author.login)" +
+      (if (.labels | length) > 0 then " — labels: \([.labels[].name] | join(", "))" else "" end) +
+      "\n\n\(.body)\n" +
+      ([.comments[] | "\n## Comment by @\(.author.login) (\(.createdAt))\n\n\(.body)\n"] | join(""))' > "$dir/issue.md"
+  fi
+  if [ -n "$prompt" ]; then
+    [ "$prompt" -ef "$dir/prompt.md" ] || cp "$prompt" "$dir/prompt.md"
+  else
+    echo "Solve GitHub issue #$issue. The issue and its comments are in ~/task/github/issue.md." > "$dir/prompt.md"
+  fi
+
+  # Base must not be running while cloned: a paused copy leaves stale dev-server/database state.
+  local base_was_running=""
+  if running "$BASE"; then base_was_running=1; orb stop "$BASE"; fi
+  orb clone "$BASE" "$P$id"
+  [ -z "$base_was_running" ] || orb start "$BASE"
+  orb start "$P$id"
+
+  g fetch -q origin
+  local refs=("+origin/main:refs/remotes/origin/main")
+  g rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null && refs+=("+origin/$branch:refs/remotes/origin/$branch")
+  g push -q "$(remote "$P$id")" "${refs[@]}"
+
+  vm "$id" agent-prepare "$id" "$branch" < "$dir/prompt.md"
+  [ -z "$issue" ] || send_github_file "$id" issue.md
+  vm "$id" agent-start
+  echo "started $P$id on $branch"
+}
+
+# A stopped machine's status can't be read, so ls shows the copy cached on the Mac.
+cache_status() { mkdir -p "$HERE/tasks/$1" && status "$1" | tee "$HERE/tasks/$1/status.json"; }
+
+cmd_ls() {
+  printf '%-8s %-40s %-12s %-6s %-6s %s\n' ID BRANCH STATE AGE PR MESSAGE
+  local id json stopped
+  for id in $(task_ids); do
+    stopped=""
+    if running "$P$id"; then
+      json=$(cache_status "$id")
+    else
+      stopped=1
+      json=$(cat "$HERE/tasks/$id/status.json" 2>/dev/null || echo '{}')
+    fi
+    jq -r --arg id "$id" --arg stopped "$stopped" '
+      (if .updated_at then ((now - (.updated_at | fromdateiso8601)) / 60 | floor | tostring) + "m" else "-" end) as $age
+      | (if $stopped == "" then .state else "(stopped)" end) as $state
+      | (if $stopped == "" or .state == null then (.message // "") else "was \(.state)" + (if .message then ": \(.message)" else "" end) end) as $msg
+      | [$id, (.branch // "-"), $state, $age, (.pr // "-" | tostring), $msg] | @tsv' <<<"$json" |
+      awk -F'\t' '{ printf "%-8s %-40s %-12s %-6s %-6s %s\n", $1, $2, $3, $4, $5, $6 }'
+  done
+}
+
+cmd_show() {
+  need "${1:-}" "show <id>"
+  status "$1" | jq .
+  vm "$1" sh -c "cat $VM_HOME/task/RESULT.md 2>/dev/null" || true
+}
+
+# vm/ is the source of /opt/task-agent; clones get it from the base, so install into the base
+# (and into running task machines only when a change must reach them now).
+cmd_install-vm() {
+  local m=${1:-base}
+  [ "$m" = base ] && m=$BASE || m=$P$m
+  COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -C "$HERE/vm" -cf - . |
+    orb_run -m "$m" sudo sh -c 'mkdir -p /opt/task-agent && tar --no-same-owner -xf - -C /opt/task-agent && chmod 755 /opt/task-agent/bin/* && ln -sf /opt/task-agent/bin/agent-* /usr/local/bin/'
+  printf 'export AGENT_REPO=%s\nexport AGENT_BASE_HOSTNAME=%s\nexport APP_PORT=%s\n' "$VM_REPO" "$BASE" "$APP_PORT" |
+    orb_run -m "$m" sudo sh -c 'cat > /opt/task-agent/project.env'
+  orb_run -m "$m" agent-install
+  echo "installed vm/ into $m:/opt/task-agent"
+}
+
+cmd_attach() {
+  need "${1:-}" "attach <id>|base"
+  if [ "$1" = base ]; then orb start "$BASE" && orb run -m "$BASE" -w "$VM_HOME" bash -l; return; fi
+  orb -m "$P$1" tmux attach -t agent
+}
+
+cmd_diff() {
+  need "${1:-}" "diff <id> [<n>]"
+  local branch base
+  branch=$(fetch_branch "$1")
+  base=$(sfield "$1" base_commit)
+  if [ -n "${2:-}" ]; then
+    [[ $2 =~ ^[1-9][0-9]*$ ]] || die "n must be a positive number"
+    base=$P$1/$branch~$2
+  fi
+  g log --oneline "$base..$P$1/$branch"
+  g diff "$base" "$P$1/$branch"
+}
+
+cmd_push() {
+  local id=${1:-} force=""
+  need "$id" "push <id> [--force]"
+  [ -z "$(vm "$id" git -C "$VM_REPO" status --porcelain)" ] || die "$P$id has uncommitted changes"
+  local branch base ref missing
+  branch=$(fetch_branch "$id")
+  protected "$branch" && die "refusing to push to $branch"
+  base=$(sfield "$id" base_commit)
+  ref=refs/remotes/$P$id/$branch
+  g fetch -q origin
+  [ "${2:-}" = --force ] && force=--force-with-lease=$branch:$(g rev-parse -q --verify "refs/remotes/origin/$branch" || true)
+  missing=$(github_only "$branch" "$ref")
+  [ -z "$missing" ] || printf 'task: origin/%s has commits %s%s lacks:\n%s\n' "$branch" "$P" "$id" "$missing" >&2
+
+  g --no-pager log --oneline "$base..$ref"
+  g --no-pager diff --stat "$base" "$ref"
+  g diff "$base" "$ref"
+  local answer
+  read -r -p "Push $branch to origin${force:+ (force with lease)}? [y/N] " answer < /dev/tty || die "no terminal to confirm on; run task push yourself"
+  [ "$answer" = y ] || [ "$answer" = Y ] || die "aborted"
+
+  g push $force origin "$ref:refs/heads/$branch"
+
+  local pr
+  pr=$(sfield "$id" pr)
+  [ -z "$pr" ] || { echo "pushed; PR updated: https://github.com/$GH_REPO/pull/$pr"; return; }
+  pr=$(gh pr list --repo "$GH_REPO" --head "$branch" --state open --json number -q '.[0].number')
+  if [ -z "$pr" ]; then
+    local result title body
+    result=$(vm "$id" cat "$VM_HOME/task/RESULT.md") || die "no RESULT.md in $P$id; open the PR by hand"
+    title=$(printf '%s\n' "$result" | sed -n 's/^# //p' | head -1)
+    body=$(printf '%s\n' "$result" | awk '/^# / && !t { t=1; next } /^---/ { exit } t')
+    [ -n "$title" ] || die "RESULT.md has no '# ' title line"
+    pr=$(gh pr create --repo "$GH_REPO" --draft --base main --head "${FORK_OWNER:+$FORK_OWNER:}$branch" --title "$title" --body "$body" | sed -n 's|.*/pull/||p')
+  fi
+  vm "$id" agent-status field pr "$pr"
+  echo "PR: https://github.com/$GH_REPO/pull/$pr"
+}
+
+cmd_sync() {
+  local id=${1:-}
+  need "$id" "sync <id> [--nudge]"
+  local pr
+  pr=$(sfield "$id" pr)
+  [ -n "$pr" ] || die "$P$id has no PR yet (task push first)"
+  mkdir -p "$HERE/tasks/$id"
+  {
+    gh pr view "$pr" --repo "$GH_REPO" --comments
+    printf '\n\n# Inline review comments\n\n'
+    gh api --paginate "repos/$GH_REPO/pulls/$pr/comments" \
+      --jq '.[] | "## \(.path):\(.line // .original_line) — @\(.user.login) (\(.created_at))\n\n\(.body)\n"'
+  } > "$HERE/tasks/$id/pr-comments.md"
+  send_github_file "$id" pr-comments.md
+  echo "wrote ~/task/github/pr-comments.md in $P$id"
+  if [ "${2:-}" = --nudge ]; then
+    cmd_say "$id" "New review comments in ~/task/github/pr-comments.md — please address them."
+  fi
+}
+
+cmd_pull-main() {
+  local id=${1:-} how=${2:-}
+  need "$id" "pull-main <id> [--rebase|--merge]"
+  case "$how" in
+    ""|--rebase|--merge) ;;
+    *) die "usage: task pull-main <id> [--rebase|--merge]";;
+  esac
+  local branch missing refs=("+origin/main:refs/remotes/origin/main" "+origin/main:refs/heads/main")
+  branch=$(fetch_branch "$id")
+  g fetch -q origin
+  g rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null && refs+=("+origin/$branch:refs/remotes/origin/$branch")
+  g push -q "$(remote "$P$id")" "${refs[@]}"
+  echo "main and origin/main${refs[2]:+ and origin/$branch} updated in $P$id"
+  missing=$(github_only "$branch" "refs/remotes/$P$id/$branch")
+  [ -z "$missing" ] || printf 'origin/%s has commits the machine lacks:\n%s\n' "$branch" "$missing"
+  [ -n "$how" ] || return 0
+  local verb="Rebase your branch onto origin/main"
+  [ "$how" = --merge ] && verb="Merge origin/main into your branch"
+  [ -z "$missing" ] || verb="origin/$branch has commits pushed on GitHub that your branch lacks; bring them in first so they aren't lost. Then: $verb"
+  vm "$id" agent-status field base_commit "$(g rev-parse origin/main)"
+  cmd_say "$id" "origin/main was updated. $verb (no fetch needed), resolve conflicts, run agent-setup if dependencies or migrations changed, rerun the relevant tests, and don't push."
+}
+
+# Claude's input treats fast multi-line/long typing as a paste and swallows an Enter sent with it.
+cmd_say() {
+  local id=${1:-} text=${2:-}
+  need "$id" 'say <id> "<message>"'
+  need "$text" 'say <id> "<message>"'
+  vm "$id" tmux send-keys -t agent -l "$text"
+  sleep 1
+  vm "$id" tmux send-keys -t agent Enter
+}
+
+cmd_view() {
+  need "${1:-}" "view <id>|base"
+  local m="$P$1"; [ "$1" = base ] && m=$BASE
+  open "http://$m.orb.local:$APP_PORT"
+}
+
+cmd_code() {
+  need "${1:-}" "code <id>|base"
+  local m="$P$1"; [ "$1" = base ] && m=$BASE
+  orb start "$m"
+  code --remote "ssh-remote+$m@orb" "$VM_REPO"
+}
+
+cmd_stop() {
+  need "${1:-}" "stop <id>|all"
+  [ "$1" = all ] || { cache_status "$1" >/dev/null || true; orb stop "$P$1"; return; }
+  local id
+  for id in $(task_ids); do running "$P$id" && { cache_status "$id" >/dev/null || true; orb stop "$P$id"; } && echo "stopped $P$id"; done
+  return 0
+}
+
+cmd_start() {
+  need "${1:-}" "start <id>"
+  orb start "$P$1"
+  vm "$1" agent-devstack
+  vm "$1" agent-start --resume
+}
+
+cmd_rm() {
+  local id=${1:-}
+  need "$id" "rm <id> [--force]"
+  exists "$P$id" || die "no machine $P$id"
+  if [ "${2:-}" != --force ]; then
+    running "$P$id" || die "start $P$id first (or --force)"
+    [ -z "$(vm "$id" git -C "$VM_REPO" status --porcelain)" ] || die "$P$id has uncommitted changes (--force to delete anyway)"
+    local branch
+    branch=$(fetch_branch "$id")
+    g fetch -q origin main
+    # Squash merges and deleted head branches leave no ancestry to check; merging the branch into
+    # main being a no-op proves its work landed.
+    if [ "$(g merge-tree --write-tree origin/main "$P$id/$branch" 2>/dev/null)" != "$(g rev-parse 'origin/main^{tree}')" ]; then
+      g fetch -q origin "$branch" 2>/dev/null || die "$branch is neither on GitHub nor merged into main (--force to delete anyway)"
+      g merge-base --is-ancestor "$P$id/$branch" FETCH_HEAD || die "$branch on GitHub lacks commits from $P$id (--force to delete anyway)"
+    fi
+  fi
+  save_artifacts "$id"
+  orb delete -f "$P$id"
+  g for-each-ref --format='%(refname)' "refs/remotes/$P$id/" | while read -r r; do g update-ref -d "$r"; done
+  echo "deleted $P$id; artifacts in tasks/$id"
+}
+
+cmd_watch() {
+  local seen stale=$((20 * 60)) interval=${TASK_WATCH_INTERVAL:-60}
+  seen=$(mktemp -d)
+  trap 'rm -rf "$seen"' EXIT
+  while true; do
+    clear
+    date '+%H:%M:%S'
+    cmd_ls
+    local id
+    for id in $(task_ids); do
+      running "$P$id" || continue
+      local line state msg age
+      line=$(status "$id" | jq -r '[(if .updated_at then (now - (.updated_at | fromdateiso8601) | floor) else 0 end), .state, (.message // "")] | @tsv') || continue
+      IFS=$'\t' read -r age state msg <<< "$line"
+      [ "$state" = working ] && [ "$age" -gt "$stale" ] && state=stale
+      if [ "$state" != "$(cat "$seen/$id" 2>/dev/null)" ]; then
+        case "$state" in
+          needs_input|blocked|done|failed|exited|stale)
+            osascript -e "display notification \"${msg//\"/}\" with title \"task $id: $state\" sound name \"default\"";;
+        esac
+        echo "$state" > "$seen/$id"
+      fi
+    done
+    sleep "$interval"
+  done
+}
+
+usage() {
+  cat <<'EOF'
+task refresh                          update the base machine to origin/main
+task new <id> <branch> [<prompt>] [--issue n]
+                                      clone base -> <base>-<id>, prepare the branch, start the agent
+task ls                               all task machines
+task show <id>                        status JSON + RESULT.md
+task attach <id>|base                 tmux into the agent session / shell in the base
+task say <id> "<message>"             type a message into the agent session (answer a blocked one)
+task diff <id> [<n>]                  fetch the branch, diff against where it started (or last n commits)
+task view <id>|base                   open the machine's dev server in the browser
+task code <id>|base                   open the machine's repo in VS Code (Remote-SSH)
+task push <id> [--force]              review the diff, confirm, push, open a draft PR
+task sync <id> [--nudge]              write PR review comments into the machine (--nudge: tell the agent)
+task pull-main <id> [--rebase|--merge]
+                                      push the latest origin/main into the machine, optionally ask the agent to rebase/merge
+task stop <id>|all, start <id>        pause/resume a machine (start restarts dev stack + agent)
+task rm <id> [--force]                delete the machine (refuses if its work isn't on GitHub)
+task install-vm [base|<id>]           copy vm/ into the machine's /opt/task-agent (default: base)
+task watch                            dashboard + notifications; run it in its own terminal
+EOF
+}
+
+cmd=${1:-}
+[ $# -eq 0 ] || shift
+case "$cmd" in
+  refresh|new|ls|show|attach|install-vm|diff|push|sync|pull-main|say|view|code|stop|start|rm|watch) "cmd_$cmd" "$@";;
+  *) usage; [ -z "$cmd" ] || [ "$cmd" = help ] || exit 1;;
+esac

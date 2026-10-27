@@ -1,0 +1,2 @@
+# PROJECT: the dev stack, run by overmind. Bind 0.0.0.0 so the Mac can reach it. Example for Rails:
+web: cd $AGENT_REPO && exec bin/rails server -b 0.0.0.0 -p $APP_PORT

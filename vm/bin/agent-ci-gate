@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook: a turn that leaves new commits can't end until agent-ci passes on them.
+# Runs agent-ci itself, so the exit code is the gate, not the agent's word; failures go back to Claude,
+# a pass sets done. Commits already green (~/task/.ci-green) aren't rerun.
+set -euo pipefail
+. /opt/task-agent/env.sh
+
+TASK_DIR=$HOME/task
+MAX_TRIES=${AGENT_MAX_FIX:-3}
+input=$(cat)
+
+idle() { agent-status hook idle <<<"$input"; exit 0; }
+block() { jq -n --arg r "$1" '{decision: "block", reason: $r}'; exit 0; }
+
+[ -f "$TASK_DIR/status.json" ] || idle
+state=$(agent-status | jq -r .state)
+case "$state" in blocked|failed) idle;; esac
+
+cd "$AGENT_REPO"
+[ -z "$(git status --porcelain)" ] || block "The working tree isn't clean (git status). Commit your work or remove leftovers, then finish."
+head=$(git rev-parse HEAD)
+[ "$head" != "$(agent-status | jq -r .base_commit)" ] || idle
+[ "$(cat "$TASK_DIR/.ci-green" 2>/dev/null)" != "$head" ] || idle
+
+agent-status set working "agent-ci (stop gate)"
+if agent-ci > "$TASK_DIR/ci.log" 2>&1; then
+  echo "$head" > "$TASK_DIR/.ci-green"
+  rm -f "$TASK_DIR/.ci-tries"
+  title=$(sed -n 's/^# //p' "$TASK_DIR/RESULT.md" 2>/dev/null | head -1)
+  agent-status set done "agent-ci green at ${head:0:8}${title:+: $title}"
+  exit 0
+fi
+
+n=$(( $(cat "$TASK_DIR/.ci-tries" 2>/dev/null || echo 0) + 1 ))
+if [ "$n" -gt "$MAX_TRIES" ]; then
+  rm -f "$TASK_DIR/.ci-tries"
+  agent-status set blocked "agent-ci still failing after $MAX_TRIES fix attempts (~/task/ci.log)"
+  exit 0
+fi
+echo "$n" > "$TASK_DIR/.ci-tries"
+block "agent-ci failed on your commits (attempt $n of $MAX_TRIES). Full log: ~/task/ci.log. Last lines:
+$(tail -n 60 "$TASK_DIR/ci.log")
+
+Fix the cause (not the check) and commit. If the failure is unrelated to your change and you can't fix it,
+run \`agent-status set blocked \"<why>\"\` and stop."

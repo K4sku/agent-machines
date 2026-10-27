@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Launch the task agent in a prepared task machine (run after agent-prepare).
+#
+#   agent-start            first launch, on ~/task/full-prompt.md (state must be ready)
+#   agent-start --resume   after the machine restarted: continues the previous conversation if
+#                          the agent isn't running
+#
+# Claude Code runs with permission checks disabled in tmux session "agent". Attach: tmux attach -t agent
+set -euo pipefail
+. /opt/task-agent/env.sh
+
+TASK_DIR="$HOME/task"
+RESUME=""
+case "${1:-}" in
+  --resume) RESUME=1;;
+  "") ;;
+  *) echo "usage: agent-start [--resume]" >&2; exit 1;;
+esac
+
+if [ "$(hostname)" = "$AGENT_BASE_HOSTNAME" ]; then
+  echo "Refusing to start an agent on the base machine. Clone it first." >&2
+  exit 1
+fi
+[ -s "$TASK_DIR/full-prompt.md" ] || { echo "No $TASK_DIR/full-prompt.md: run agent-prepare first." >&2; exit 1; }
+
+# Secrets the agent needs, e.g. CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token` on the Mac).
+env_file="$HOME/.config/task-agent/env"
+source_env=""
+[ -f "$env_file" ] && source_env="set -a; . '$env_file'; set +a;"
+
+if [ -n "$RESUME" ]; then
+  tmux has-session -t agent 2>/dev/null && exit 0
+  tmux new-session -d -s agent -c "$AGENT_REPO" "$source_env claude --continue --dangerously-skip-permissions; exec bash"
+else
+  state=$(agent-status | jq -r .state)
+  [ "$state" = ready ] || { echo "Task state is '$state', expected 'ready'." >&2; exit 1; }
+  ! tmux has-session -t agent 2>/dev/null || { echo "An agent is already running here (tmux session 'agent')." >&2; exit 1; }
+  agent-status set working "agent started"
+  tmux new-session -d -s agent -c "$AGENT_REPO" \
+    "$source_env claude --dangerously-skip-permissions \"\$(cat '$TASK_DIR/full-prompt.md')\"; exec bash"
+fi
+echo "Agent started in $(hostname). Attach: tmux attach -t agent"

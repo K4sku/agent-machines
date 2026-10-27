@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run by `task install-vm` after copying vm/ in: wires Claude Code to the agent tooling so that
+# `agent-start` needs no interaction (status hooks + CI gate, no bypass-mode warning, repo trusted).
+set -euo pipefail
+. /opt/task-agent/env.sh
+
+mkdir -p ~/.claude
+s=~/.claude/settings.json
+[ -s "$s" ] || echo '{}' > "$s"
+jq -s '.[0] * .[1]' "$s" /opt/task-agent/claude-settings.json > "$s.new" && mv "$s.new" "$s"
+
+c=~/.claude.json
+[ -s "$c" ] || echo '{}' > "$c"
+jq --arg r "$AGENT_REPO" '.hasCompletedOnboarding = true | .projects[$r].hasTrustDialogAccepted = true' "$c" > "$c.new" && mv "$c.new" "$c"
+
+grep -qF /opt/task-agent/env.sh ~/.bashrc || echo '. /opt/task-agent/env.sh' >> ~/.bashrc

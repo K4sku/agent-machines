@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Prepare a freshly cloned task machine for a task.
+#
+#   agent-prepare TASK_ID BRANCH < prompt.md
+#
+# Puts the repo on BRANCH (from origin/BRANCH if the Mac pushed one in, else new from origin/main),
+# runs agent-setup, starts the dev stack and writes ~/task/full-prompt.md (task preamble + prompt).
+# It does NOT launch the agent; the status ends as "ready".
+#
+# Machines have no GitHub access: this does NOT fetch. The Mac pushes refs in beforehand.
+set -euo pipefail
+. /opt/task-agent/env.sh
+
+TASK_ID="${1:-}"; BRANCH="${2:-}"
+[ -n "$TASK_ID" ] && [ -n "$BRANCH" ] || { echo "usage: agent-prepare TASK_ID BRANCH < prompt.md" >&2; exit 1; }
+TASK_DIR="$HOME/task"
+
+if [ "$(hostname)" = "$AGENT_BASE_HOSTNAME" ]; then
+  echo "Refusing to prepare a task on the base machine. Clone it first." >&2
+  exit 1
+fi
+
+mkdir -p "$TASK_DIR/github"
+if [ ! -t 0 ]; then cat > "$TASK_DIR/prompt.md"; fi
+[ -s "$TASK_DIR/prompt.md" ] || { echo "No prompt: pipe it on stdin or put it in $TASK_DIR/prompt.md" >&2; exit 1; }
+
+jq -n --arg task "$TASK_ID" --arg branch "$BRANCH" --arg host "$(hostname)" \
+  '{task: $task, branch: $branch, machine: $host}' > "$TASK_DIR/status.json"
+agent-status set starting "preparing branch"
+
+fail() { agent-status set failed "$1"; echo "$1" >&2; exit 1; }
+
+cd "$AGENT_REPO"
+[ -z "$(git status --porcelain)" ] || fail "repo has uncommitted changes"
+if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+  git switch --no-track -c "$BRANCH" "origin/$BRANCH" || fail "cannot create $BRANCH from origin/$BRANCH"
+else
+  git switch --no-track -c "$BRANCH" origin/main || fail "cannot create $BRANCH from origin/main"
+fi
+# The base keeps main checked out, so the Mac can't push it; move it here, off the checkout.
+git branch -f main origin/main
+# Record where the branch started, so the Mac knows what's new.
+tmp=$(mktemp "$TASK_DIR/.status.XXXXXX")
+jq --arg base "$(git rev-parse HEAD)" '. + {base_commit: $base}' "$TASK_DIR/status.json" > "$tmp" && mv "$tmp" "$TASK_DIR/status.json"
+
+agent-status set starting "installing dependencies"
+agent-setup || fail "agent-setup failed"
+
+agent-status set starting "starting dev stack"
+agent-devstack || fail "dev stack did not come up on localhost:$APP_PORT"
+
+sed -e "s|{{BRANCH}}|$BRANCH|g" -e "s|{{TASK_ID}}|$TASK_ID|g" -e "s|{{REPO}}|$AGENT_REPO|g" -e "s|{{PORT}}|$APP_PORT|g" \
+  /opt/task-agent/task-preamble.md > "$TASK_DIR/full-prompt.md"
+cat "$TASK_DIR/prompt.md" >> "$TASK_DIR/full-prompt.md"
+
+agent-status set ready "branch $BRANCH prepared, dev stack up"
+echo "Task $TASK_ID prepared on $BRANCH in $(hostname)."
