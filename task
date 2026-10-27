@@ -194,6 +194,21 @@ cmd_attach() {
   orb -m "$P$1" tmux attach -t agent
 }
 
+cmd_tmux() {
+  [ -n "${TMUX:-}" ] || die "run inside tmux"
+  local id branch name open win
+  open=$(tmux list-windows -F '#W')
+  for id in ${@:-$(task_ids)}; do
+    running "$P$id" || { [ $# -eq 0 ] || echo "task: $P$id is not running" >&2; continue; }
+    branch=$(cat "$HERE/tasks/$id/branch" 2>/dev/null) || continue
+    name=${branch##*/}
+    name=${id}_${name#"$id"-}
+    grep -qxF "$name" <<<"$open" && continue
+    win=$(tmux new-window -d -P -F '#{window_id}' -n "$name" -e TASK_AGENT_ID="$id" -c "$HERE")
+    tmux split-window -d -v -t "$win" -e TASK_AGENT_ID="$id" -c "$HERE" "$HERE/task attach $id; exec \$SHELL"
+  done
+}
+
 cmd_diff() {
   need "${1:-}" "diff <id> [<n>]"
   local branch base
@@ -385,6 +400,8 @@ task new <id> <branch> [<prompt>] [--issue n]
 task ls                               all task machines
 task show <id>                        status JSON + RESULT.md
 task attach <id>|base                 tmux into the agent session / shell in the base
+task tmux [<id>...]                   a tmux window per running task: Mac shell over the agent session;
+                                      <id> can be left out of commands typed in that shell
 task say <id> "<message>"             type a message into the agent session (answer a blocked one)
 task diff <id> [<n>]                  fetch the branch, diff against where it started (or last n commits)
 task view <id>|base                   open the machine's dev server in the browser
@@ -402,7 +419,15 @@ EOF
 
 cmd=${1:-}
 [ $# -eq 0 ] || shift
+# Windows opened by `task tmux` set TASK_AGENT_ID, so the id can be left out there.
 case "$cmd" in
-  refresh|new|ls|show|attach|install-vm|diff|push|sync|pull-main|say|view|code|stop|start|rm|watch) "cmd_$cmd" "$@";;
+  show|attach|code|diff|push|pull-main|sync|say|view|stop|start|rm)
+    if [ -n "${TASK_AGENT_ID:-}" ] && { [ $# -eq 0 ] || [[ $1 == --* ]] || { [ "$cmd" = say ] && [ $# -eq 1 ]; }; }; then
+      echo "task: $cmd $TASK_AGENT_ID (from TASK_AGENT_ID)" >&2
+      set -- "$TASK_AGENT_ID" "$@"
+    fi;;
+esac
+case "$cmd" in
+  refresh|new|ls|show|attach|tmux|install-vm|diff|push|sync|pull-main|say|view|code|stop|start|rm|watch) "cmd_$cmd" "$@";;
   *) usage; [ -z "$cmd" ] || [ "$cmd" = help ] || exit 1;;
 esac

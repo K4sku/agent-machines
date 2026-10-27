@@ -21,6 +21,7 @@ Requires macOS with [OrbStack](https://orbstack.dev), `gh` logged in, `jq`. Sett
 
     ./task new 12 fix/12-report-totals --issue 12    # clone the base, prepare the branch, start the agent
     ./task watch                                     # own terminal: dashboard + notifications
+    ./task tmux                                      # inside tmux: a window per task, Mac shell over the agent
     ./task attach 12                                 # watch or talk to the agent (tmux)
     ./task say 12 "use the existing helper"          # answer a blocked agent
     ./task diff 12                                   # review
